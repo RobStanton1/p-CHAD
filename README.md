@@ -1,2 +1,2 @@
 # p-CHAD
-persistent Channel Hopping on Activity Detection
+p-persistent Channel Hop on Activity Detection
