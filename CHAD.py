@@ -189,6 +189,45 @@ def checkACK(packet):
         Tpream = (8 + 4.25)*Tsym
         nodes[packet.nodeid].rxtime += Tpream
         return packet.acked
+
+# check if the gateway can ack this packet at 10% channel
+# based on the duy cycle
+def checkACK_2(packet):
+    global  nearstACK1p
+    global  nearstACK10p
+    # check ack in the first window
+    # chanlindex=[872000000, 864000000, 860000000].index(packet.freq)
+    timeofacking = env.now + 1  # one sec after receiving the packet
+    if (timeofacking >= nearstACK10p):
+        # this packet can be acked
+        packet.acked = 1
+        tempairtime = airtime(12, CodingRate, AckMessLen+LorawanHeader, Bandwidth)
+        nearstACK10p = timeofacking+(tempairtime/0.1)
+        nodes[packet.nodeid].rxtime += tempairtime
+        return packet.acked
+    else:
+        # this packet can not be acked
+        packet.acked = 0
+        Tsym = (2**12)/(Bandwidth*1000) # sec
+        Tpream = (8 + 4.25)*Tsym
+        nodes[packet.nodeid].rxtime += Tpream
+
+    # chcek ack in the second window
+    timeofacking = env.now + 2  # two secs after receiving the packet
+    if (timeofacking >= nearstACK10p):
+        # this packet can be acked
+        packet.acked = 1
+        tempairtime = airtime(12, CodingRate, AckMessLen+LorawanHeader, Bandwidth)
+        nearstACK10p = timeofacking+(tempairtime/0.1)
+        nodes[packet.nodeid].rxtime += tempairtime
+        return packet.acked
+    else:
+        # this packet can not be acked
+        packet.acked = 0
+        Tsym = (2.0**12)/(Bandwidth*1000.0) # sec
+        Tpream = (8 + 4.25)*Tsym
+        nodes[packet.nodeid].rxtime += Tpream
+        return packet.acked
 #
 # frequencyCollision, conditions
 #
@@ -328,39 +367,42 @@ def airtime(sf,cr,pl,bw):
 # Rob addition
 #
 def preambleTime(sf,cr,pl,bw):
-    H = 0        # implicit header disabled (H=0) or not (H=1)
-    DE = 0       # low data rate optimization enabled (=1) or not (=0)
-    Npream = 8   # number of preamble symbol (12.25  from Utz paper)
 
-    if bw == 125 and sf in [11, 12]:
-        # low data rate optimization mandated for BW125 with SF11 and SF12
-        DE = 1
-    if sf == 6:
-        # can only have implicit header with SF6
-        H = 1
+    Npream = 8   # number of preamble symbol (12.25  from Utz paper)
 
     Tsym = (2.0**sf)/bw  # msec
     Tpream = (Npream + 4.25)*Tsym
     return Tpream / 1000.0
 
 #
+# this function computes the time a node spends in CAD (Casals paper)
+# Rob addition
+#
+def CADTime(sf,bw):
+
+    Tcad = ((2.0**sf)+32)/bw  # msec
+    return Tcad / 1000.0
+
+#
 # this funtion performs channel activity detection (CAD)
 # Rob addition
 #
-def performCAD(packet):
-    col = 0    
+def performCAD(node):
+    free = True   
     if packetsAtBS:
         for other in packetsAtBS:
-            if other.nodeid != packet.nodeid:
-                if packet.freq == other.packet.freq: # if nodes using same channel
+            if other.nodeid != node.packet.nodeid:
+                if node.packet.freq == other.packet.freq: # if nodes using same channel
                     if env.now < other.packet.addTime + other.packet.pretime: # other packet preambling
-                        col = 1
+                        free = False
+                        print "node ", node.packet.nodeid, "freq: ", node.packet.freq, "node ", other.packet.nodeid, "freq", other.packet.freq
                         print "other arrival time", other.packet.addTime
                         print "current time: ", env.now
                         print "other preamble time", other.packet.pretime
                         print "other preamble end-time:", other.packet.addTime + other.packet.pretime
-        return col        
-    return col
+                        #raw_input("continue...")
+        return free        
+    return free
 
 #
 # this function creates a node
@@ -383,6 +425,7 @@ class myNode():
         self.rxtime = 0
         self.x = 0
         self.y = 0
+        self.dropped = 0
 
         # this is very complex prodecure for placing nodes
         # and ensure minimum distance between each pair of nodes
@@ -433,6 +476,8 @@ class assignParameters():
         global var
         global Lpld0
         global GL
+        global channels
+
 
         self.nodeid = nodeid
         self.txpow = 14
@@ -440,7 +485,7 @@ class assignParameters():
         self.cr = CodingRate
         self.sf = 12
         self.rectime = airtime(self.sf, self.cr, LorawanHeader+PcktLength_SF[self.sf-7], self.bw)
-        self.freq = random.choice([872000000, 864000000, 860000000])
+        self.freq = random.choice(channels)
 
         Prx = self.txpow  ## zero path loss by default
         # log-shadow
@@ -509,9 +554,13 @@ class myPacket():
         self.rectime = airtime(self.sf,self.cr,self.pl,self.bw)
         print "rectime node ", self.nodeid, "  ", self.rectime
         
-        # Rob addition (packet preamble time in seconds)
+        # preamble time and cad time
+        # Rob addition
+
         self.pretime = preambleTime(self.sf,self.cr,self.pl,self.bw)
         print "pretime node ", self.nodeid, "  ", self.pretime
+
+        self.cadtime = CADTime(self.sf, self.bw)
 
         # denote if packet is collided
         self.collided = 0
@@ -540,110 +589,138 @@ def transmit(env,node):
             node.lstretans = 0
             yield env.timeout(random.expovariate(1.0/float(node.period)))
 
+        tryToSend = False
+        hopCount = 0
+        yield env.timeout(node.packet.cadtime)
+        node.rxtime += node.packet.cadtime
+        channelFree = performCAD(node)
+        if channelFree:
+            tryToSend = True
+        else:
+            while hopCount < nrHops:
+                node.packet.freq = channels[(channels.index(node.packet.freq) + 1) % 3]
+                print "node: ", node.nodeid, "changing frequency to ", node.packet.freq
+                #raw_input("continue...")
+                yield env.timeout(node.packet.cadtime)
+                node.rxtime += node.packet.cadtime
+                channelFree = performCAD(node)
+                if channelFree:
+                    tryToSend = True
+                    hopCount = nrHops
+                else:
+                    hopCount += 1
         
-        node.buffer -= PcktLength_SF[node.parameters.sf-7]
+        node.buffer -= PcktLength_SF[node.parameters.sf-7] #buffer is decremented for succes or fail
         print "node {0.nodeid} buffer {0.buffer} bytes".format(node)
-
-        # time sending and receiving
-        # packet arrives -> add to base station
-        node.sent = node.sent + 1
         
-        if (node in packetsAtBS):
-            print "ERROR: packet already in"
-        else:
-            sensitivity = sensi[node.packet.sf - 7, [125,250,500].index(node.packet.bw) + 1]
-            if node.packet.rssi < sensitivity:
-                print "node {}: packet will be lost".format(node.nodeid)
-                node.packet.lost = True
-            else:
+        if tryToSend:
+            sendPacket = np.random.choice([True, False], p = [persist, 1.0 - persist])
+            if sendPacket:
+                print "packet sent"
+                node.sent = node.sent + 1
+                if (node in packetsAtBS):
+                    print "ERROR: packet already in"
+                else:
+                    sensitivity = sensi[node.packet.sf - 7, [125,250,500].index(node.packet.bw) + 1]
+                    if node.packet.rssi < sensitivity:
+                        print "node {}: packet will be lost".format(node.nodeid)
+                        node.packet.lost = True
+                    else:
+                        node.packet.lost = False
+                        if (per(node.packet.sf,node.packet.bw,node.packet.cr,node.packet.rssi,node.packet.pl) < random.uniform(0,1)):
+                            # OK CRC
+                            node.packet.perror = False
+                        else:
+                            # Bad CRC
+                            node.packet.perror = True
+                        # adding packet if no collision
+                        if (checkcollision(node.packet)==1):
+                            node.packet.collided = 1
+                        else:
+                            node.packet.collided = 0
+
+                        packetsAtBS.append(node)
+                        node.packet.addTime = env.now
+                        print "packet arrival time: ", node.packet.addTime
+                        
+
+                yield env.timeout(node.packet.rectime)
+
+                if (node.packet.lost == 0\
+                        and node.packet.perror == False\
+                        and node.packet.collided == False\
+                        and checkACK(node.packet)):
+                    node.packet.acked = 1
+                    # the packet can be acked
+                    # check if the ack is lost or not
+                    if((14 - Lpld0 - 10*gamma*math.log10(node.dist/d0) - np.random.normal(-var, var)) > sensi[node.packet.sf-7, [125,250,500].index(node.packet.bw) + 1]):
+                    # the ack is not lost
+                        node.packet.acklost = 0
+                    else:
+                    # ack is lost
+                        node.packet.acklost = 1
+                else:
+                    node.packet.acked = 0
+
+                if node.packet.processed == 1:
+                    global nrProcessed
+                    nrProcessed = nrProcessed + 1
+                if node.packet.lost:
+                    #node.buffer += PcktLength_SF[node.parameters.sf-7]
+                    print "node {0.nodeid} buffer {0.buffer} bytes".format(node)
+                    node.lost = node.lost + 1
+                    node.lstretans += 1
+                    global nrLost
+                    nrLost += 1
+                elif node.packet.perror:
+                    print "node {0.nodeid} buffer {0.buffer} bytes".format(node)
+                    node.losterror = node.losterror + 1
+                    global nrLostError
+                    nrLostError += 1
+                elif node.packet.collided == 1:
+                    #node.buffer += PcktLength_SF[node.parameters.sf-7]
+                    print "node {0.nodeid} buffer {0.buffer} bytes".format(node)
+                    node.coll = node.coll + 1
+                    node.lstretans += 1
+                    global nrCollisions
+                    nrCollisions = nrCollisions +1
+                elif node.packet.acked == 0:
+                    #node.buffer += PcktLength_SF[node.parameters.sf-7]
+                    print "node {0.nodeid} buffer {0.buffer} bytes".format(node)
+                    node.noack = node.noack + 1
+                    node.lstretans += 1
+                    global nrNoACK
+                    nrNoACK += 1
+                elif node.packet.acklost == 1:
+                    #node.buffer += PcktLength_SF[node.parameters.sf-7]
+                    print "node {0.nodeid} buffer {0.buffer} bytes".format(node)
+                    node.acklost = node.acklost + 1
+                    node.lstretans += 1
+                    global nrACKLost
+                    nrACKLost += 1
+                else:
+                    node.recv = node.recv + 1
+                    node.lstretans = 0
+                    global nrReceived
+                    nrReceived = nrReceived + 1
+
+                # complete packet has been received by base station
+                # can remove it
+                if (node in packetsAtBS):
+                    packetsAtBS.remove(node)
+                    # reset the packet
+                node.packet.collided = 0
+                node.packet.processed = 0
                 node.packet.lost = False
-                if (per(node.packet.sf,node.packet.bw,node.packet.cr,node.packet.rssi,node.packet.pl) < random.uniform(0,1)):
-                    # OK CRC
-                    node.packet.perror = False
-                else:
-                    # Bad CRC
-                    node.packet.perror = True
-                # adding packet if no collision
-                if (checkcollision(node.packet)==1):
-                    node.packet.collided = 1
-                else:
-                    node.packet.collided = 0
-
-                packetsAtBS.append(node)
-                node.packet.addTime = env.now
-                print "packet arrival time: ", node.packet.addTime
-                
-
-        yield env.timeout(node.packet.rectime)
-
-        if (node.packet.lost == 0\
-                and node.packet.perror == False\
-                and node.packet.collided == False\
-                and checkACK(node.packet)):
-            node.packet.acked = 1
-            # the packet can be acked
-            # check if the ack is lost or not
-            if((14 - Lpld0 - 10*gamma*math.log10(node.dist/d0) - np.random.normal(-var, var)) > sensi[node.packet.sf-7, [125,250,500].index(node.packet.bw) + 1]):
-            # the ack is not lost
+                node.packet.acked = 0
                 node.packet.acklost = 0
-            else:
-            # ack is lost
-                node.packet.acklost = 1
         else:
-            node.packet.acked = 0
-
-        if node.packet.processed == 1:
-            global nrProcessed
-            nrProcessed = nrProcessed + 1
-        if node.packet.lost:
-            #node.buffer += PcktLength_SF[node.parameters.sf-7]
-            print "node {0.nodeid} buffer {0.buffer} bytes".format(node)
-            node.lost = node.lost + 1
+            print "packet not sent"
+            #raw_input("continue")
+            node.dropped = node.dropped + 1
             node.lstretans += 1
-            global nrLost
-            nrLost += 1
-        elif node.packet.perror:
-            print "node {0.nodeid} buffer {0.buffer} bytes".format(node)
-            node.losterror = node.losterror + 1
-            global nrLostError
-            nrLostError += 1
-        elif node.packet.collided == 1:
-            #node.buffer += PcktLength_SF[node.parameters.sf-7]
-            print "node {0.nodeid} buffer {0.buffer} bytes".format(node)
-            node.coll = node.coll + 1
-            node.lstretans += 1
-            global nrCollisions
-            nrCollisions = nrCollisions +1
-        elif node.packet.acked == 0:
-            #node.buffer += PcktLength_SF[node.parameters.sf-7]
-            print "node {0.nodeid} buffer {0.buffer} bytes".format(node)
-            node.noack = node.noack + 1
-            node.lstretans += 1
-            global nrNoACK
-            nrNoACK += 1
-        elif node.packet.acklost == 1:
-            #node.buffer += PcktLength_SF[node.parameters.sf-7]
-            print "node {0.nodeid} buffer {0.buffer} bytes".format(node)
-            node.acklost = node.acklost + 1
-            node.lstretans += 1
-            global nrACKLost
-            nrACKLost += 1
-        else:
-            node.recv = node.recv + 1
-            node.lstretans = 0
-            global nrReceived
-            nrReceived = nrReceived + 1
-
-        # complete packet has been received by base station
-        # can remove it
-        if (node in packetsAtBS):
-            packetsAtBS.remove(node)
-            # reset the packet
-        node.packet.collided = 0
-        node.packet.processed = 0
-        node.packet.lost = False
-        node.packet.acked = 0
-        node.packet.acklost = 0
+            global nrDropped
+            nrDropped += 1
 
 #
 # "main" program
@@ -667,6 +744,7 @@ else:
 
 # global stuff
 nodes = []
+channels = [872000000, 864000000, 860000000]
 nodeder1 = [0 for i in range(0,nrNodes)]
 nodeder2 = [0 for i in range(0,nrNodes)]
 tempdists = [0 for i in range(0,nrNodes)]
@@ -676,6 +754,10 @@ BWdistribution = [0 for x in range(0,3)]
 CRdistribution = [0 for x in range(0,4)]
 TXdistribution = [0 for x in range(0,13)]
 env = simpy.Environment()
+
+# placeholder parameters
+nrHops = 2
+persist = 1.0
 
 # maximum number of packets the BS can receive at the same time
 maxBSReceives = 8
@@ -687,9 +769,11 @@ nrCollisions = 0
 nrReceived = 0
 nrProcessed = 0
 nrLost = 0
+nrDropped = 0
 nrLostError = 0
 nrNoACK = 0
 nrACKLost = 0
+
 
 Ptx = 9.75
 gamma = 2.08
@@ -757,6 +841,7 @@ print "collisions: ", nrCollisions
 print "received packets: ", nrReceived
 print "processed packets: ", nrProcessed
 print "lost packets: ", nrLost
+print "dropped packets: ", nrDropped
 print "Bad CRC: ", nrLostError
 print "NoACK packets: ", nrNoACK
 # data extraction rate
