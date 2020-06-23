@@ -391,18 +391,44 @@ def performCAD(node):
     free = True   
     if packetsAtBS:
         for other in packetsAtBS:
-            if other.nodeid != node.packet.nodeid:
-                if node.packet.freq == other.packet.freq: # if nodes using same channel
-                    if env.now < other.packet.addTime + other.packet.pretime: # other packet preambling
-                        free = False
-                        print "node ", node.packet.nodeid, "freq: ", node.packet.freq, "node ", other.packet.nodeid, "freq", other.packet.freq
-                        print "other arrival time", other.packet.addTime
-                        print "current time: ", env.now
-                        print "other preamble time", other.packet.pretime
-                        print "other preamble end-time:", other.packet.addTime + other.packet.pretime
-                        #raw_input("continue...")
+            if node.nodeid != other.nodeid: # nodes are different
+                if node.packet.sf == other.packet.sf: # nodes use same sf
+                    if node.packet.freq == other.packet.freq: # nodes use same freq
+                        if env.now < other.packet.addTime + other.packet.pretime: # other packet preambling
+                            if checkRange(node, other): # nodes in hearing range last for efficiency
+                                free = False
+                            print "node ", node.packet.nodeid, "freq: ", node.packet.freq, "node ", other.packet.nodeid, "freq", other.packet.freq
+                            print "other arrival time", other.packet.addTime
+                            print "current time: ", env.now
+                            print "other preamble time", other.packet.pretime
+                            print "other preamble end-time:", other.packet.addTime + other.packet.pretime
+                            raw_input("continue...")
         return free        
     return free
+
+#
+# this function determines if nodes are within hearing range of each other
+# Rob addition
+#
+def checkRange(node1, node2):
+    # calculate distance between nodes
+    x1, y1 = node1.x, node1.y
+    x2, y2 = node2.x, node2.y 
+    distance = np.sqrt((x2-x1)**2 + (y2-y1)**2)
+    # calculate path loss over new distance
+    if var == 0:
+        Lpl = Lpld0 + 10*gamma*math.log10(distance/d0)
+    else:
+        Lpl = Lpld0 + 10*gamma*math.log10(distance/d0) + np.random.normal(-var, var)
+    # calculate node2 rssi
+    rssi = node2.packet.txpow - GL - Lpl
+    # test rssi vs. sensitivity 
+    sensitivity = sensi[node2.packet.sf - 7, [125,250,500].index(node2.packet.bw) + 1]
+    if rssi < sensitivity:
+        print "node are not in range"
+        return False
+    print "nodes are in range"
+    return True
 
 #
 # this function creates a node
@@ -588,7 +614,7 @@ def transmit(env,node):
             node.first = 0
             node.lstretans = 0
             yield env.timeout(random.expovariate(1.0/float(node.period)))
-
+        
         tryToSend = False
         hopCount = 0
         yield env.timeout(node.packet.cadtime)
